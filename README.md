@@ -1,6 +1,6 @@
-# clipboard_server —— 剪贴板服务器
+# clipboard_server —— Linux 剪贴板监视与历史服务
 
-一个用 Erlang/OTP 编写的剪贴板服务器，监听系统剪贴板并把每次写入的内容持久化到本地 SQLite 数据库，并提供模糊搜索（grep 式）接口，方便前端构建历史查询功能。
+一个用 Erlang/OTP 编写的剪贴板服务：**持续监听系统剪贴板**，把每次变化的内容持久化到本地 SQLite 数据库，并提供 REST API 和 Web 前端，方便随时检索、过滤、复制历史记录。
 
 ---
 
@@ -11,69 +11,83 @@
 - [文件结构](#-文件结构)
 - [环境依赖](#-环境依赖)
 - [构建与运行](#-构建与运行)
-- [使用示例](#-使用示例)
-- [数据存储位置](#-数据存储位置)
-- [数据库结构](#-数据库结构)
-- [NIF 接口说明](#-nif-接口说明)
-- [Erlang API 参考](#-erlang-api-参考)
-- [调试指南](#-调试指南)
-- [常见问题排查](#-常见问题排查)
-- [设计决策说明](#-设计决策说明)
+- [Erlang API](#-erlang-api)
+- [数据存储](#-数据存储)
+- [HTTP API](#-http-api)
+- [前端使用与测试](#-前端使用与测试)
+- [调试与排查](#-调试与排查)
+- [设计说明](#-设计说明)
 - [扩展建议](#-扩展建议)
 
 ---
 
 ## ✨ 功能特性
 
-- **读写系统剪贴板**：通过外部命令 `xclip`（X11）或 `wl-copy` / `wl-paste`（Wayland）操作剪贴板，不依赖 `wx` 库，无图形环境也能稳定运行。
-- **持久化历史**：每次写入剪贴板后异步落库，重启不丢失。
-- **模糊搜索**：支持 SQL `LIKE '%pattern%'` 语义的 grep 式过滤，可直接用于前端搜索框。
-- **自研精简 SQLite NIF**：不引入任何第三方 Erlang SQLite 绑定，只实现项目所需的 8 个核心 C 函数，代码完全可控。
-- **OTP 规范**：完全遵循 `application` / `supervisor` / `gen_server` 分层，进程崩溃可自动重启。
-- **脏调度器**：所有数据库 NIF 运行在脏 I/O 调度器上，不阻塞 Erlang 主调度器。
+| 能力 | 说明 |
+|---|---|
+| **自动监视** | 后台轮询系统剪贴板（默认 800ms），用户复制任何文本都会自动记录 |
+| **读写剪贴板** | 通过 `xclip`（X11）或 `wl-copy` / `wl-paste`（Wayland）操作 |
+| **持久化** | 全部历史写入本地 SQLite 数据库，重启不丢失 |
+| **智能去重** | 归一化后比较最后一条，忽略首尾空白、换行、零宽字符导致的假重复 |
+| **非文本跳过** | 截图、图片、文件等非 UTF-8 剪贴板内容自动忽略，不写入历史 |
+| **模糊搜索** | SQL `LIKE '%pattern%'` 语义，支持 `%`（任意串）和 `_`（单字符）通配符 |
+| **REST API** | 标准 JSON 接口，任何前端/脚本都能查询和写入 |
+| **Web 前端** | 内置单文件 HTML 页面，带示例 pill、搜索高亮、自动刷新、一键复制 |
+| **失败容错** | 读取失败自动指数退避；`pg` 组不可用时静默降级，watcher 不崩 |
+| **完全自包含** | 自研精简 SQLite NIF，只依赖 Erlang 和系统剪贴板工具 |
 
 ---
 
 ## 🏗️ 系统架构
 
 ```
-       调用方（前端 / Eshell / 其他 OTP 进程）
+            系统剪贴板 (X11 / Wayland)
                      │
-                     ▼
-        ┌────────────────────────┐
-        │   clipboard_server     │  ← 写/读系统剪贴板
-        │   （gen_server）       │     并通过 cast 异步落库
-        └───────────┬────────────┘
-                    │ gen_server:cast({insert, Text})
-                    ▼
-        ┌────────────────────────┐
-        │   clipboard_store      │  ← 串行化所有数据库操作
-        │   （gen_server）       │     调用 NIF 执行 SQL
-        └───────────┬────────────┘
-                    │ clipboard_sqlite_nif:insert/3 等
-                    ▼
-        ┌────────────────────────┐
-        │  clipboard_sqlite_nif  │  ← Erlang 壳层，加载 .so
-        │   （-on_load 加载）    │
-        └───────────┬────────────┘
-                    │ NIF
-                    ▼
-        ┌────────────────────────┐
-        │  clipboard_sqlite_nif.so│ ← 自研 C 代码 + SQLite amalgamation
-        │  （ERL_NIF_DIRTY_*）   │
-        └───────────┬────────────┘
-                    │ SQLite C API
-                    ▼
-        ~/.local/share/clipboard_server/clipboard.db
+       ┌─────────────┴─────────────┐
+       │                           │
+       ▼ 读                        ▼ 写
+┌────────────────┐         ┌────────────────┐
+│clipboard_      │         │clipboard_      │
+│watcher         │         │server          │
+│(每 800ms 轮询) │         │(读写 API)      │
+└───────┬────────┘         └───────┬────────┘
+        │ cast({insert_bin, Bin})  │
+        ▼                          │
+┌───────────────────────────────────────┐
+│           clipboard_store             │
+│      (gen_server, 串行化 SQL)         │
+│   去重检查 → NIF 调用 → SQLite        │
+└────────────────┬──────────────────────┘
+                 │ NIF
+                 ▼
+        clipboard_sqlite_nif.so
+        (C + SQLite amalgamation)
+                 │
+                 ▼
+   ~/.local/share/clipboard_server/clipboard.db
+
+                 ▲ REST
+                 │
+      ┌──────────┴──────────┐
+      │  clipboard_http     │  ← Cowboy HTTP 服务
+      │  (REST + 静态页面)  │
+      └─────────────────────┘
+                 ▲
+                 │ HTTP
+          浏览器 / curl / 脚本
 ```
 
-监督树结构：
+**监督树**（`one_for_one`）：
 
 ```
-clipboard_server_sup (supervisor, one_for_one)
-├── clipboard_store  (worker, permanent)   ← 先启动
-└── clipboard_server (worker, permanent)   ← 后启动（依赖 store）
+clipboard_server_sup
+├── clipboard_store      先启动，其他进程依赖它
+├── clipboard_server     剪贴板读写
+├── clipboard_watcher    监视器
+└── clipboard_http       HTTP 服务
 ```
+
+启动顺序很重要：store 必须最先起，因为 watcher 会向它 cast 消息。
 
 ---
 
@@ -81,53 +95,63 @@ clipboard_server_sup (supervisor, one_for_one)
 
 ```
 clipboard_server/
-├── rebar.config                      # rebar3 配置，含 pre_hooks 触发 C 编译
-├── README.md                         # 本文档
+├── rebar.config                  rebar3 配置（含 C 编译 pre_hook）
+├── README.md                     本文档
+├── config/
+│   └── sys.config                运行配置（端口、轮询间隔）
 ├── c_src/
-│   ├── Makefile                      # 编译 NIF 到 priv/
-│   ├── clipboard_sqlite_nif.c        # 自研 NIF 实现（8 个函数）
-│   ├── sqlite3.c                     # SQLite amalgamation（需自行下载）
-│   └── sqlite3.h                     # SQLite amalgamation（需自行下载）
-├── priv/                             # 编译产物目录（自动创建）
-│   └── clipboard_sqlite_nif.so       # 生成的 NIF 动态库
+│   ├── Makefile                  编译 NIF 到 priv/
+│   ├── clipboard_sqlite_nif.c    自研 NIF（8 个函数）
+│   ├── sqlite3.c                 SQLite amalgamation
+│   └── sqlite3.h                 SQLite amalgamation
+├── priv/
+│   ├── clipboard_sqlite_nif.so   生成的 NIF 动态库
+│   └── index.html                前端页面
 └── src/
-    ├── clipboard_server.app.src      # 应用资源描述
-    ├── clipboard_server_app.erl      # application 回调
-    ├── clipboard_server_sup.erl      # 顶层监督者
-    ├── clipboard_server.erl          # 剪贴板读写 + 历史查询转发
-    ├── clipboard_store.erl           # 持久化层（gen_server）
-    └── clipboard_sqlite_nif.erl      # NIF 的 Erlang 壳层
+    ├── clipboard_server.app.src
+    ├── clipboard_server_app.erl
+    ├── clipboard_server_sup.erl
+    ├── clipboard_tools.erl       工具探测 + 读写封装
+    ├── clipboard_server.erl      剪贴板读写 + 历史查询转发
+    ├── clipboard_store.erl       持久化层（去重、NIF 调用）
+    ├── clipboard_watcher.erl     轮询监视器
+    ├── clipboard_http.erl        Cowboy listener 启动
+    ├── clipboard_http_handler.erl REST 路由
+    └── clipboard_sqlite_nif.erl  NIF 的 Erlang 壳层
 ```
 
 ---
 
 ## 🧰 环境依赖
 
-### 运行时依赖
+### 运行时
 
-| 依赖 | 用途 | 安装（Debian/Ubuntu） |
-|---|---|---|
-| Erlang/OTP | ≥ 26（本项目在 OTP 29 上测试） | 建议用 mise / kerl / asdf 管理 |
-| rebar3 | 构建工具 | `mise use -g rebar` 或官网下载 |
-| `xclip` | X11 环境剪贴板工具 | `sudo apt install xclip` |
-| `wl-clipboard` | Wayland 环境剪贴板工具 | `sudo apt install wl-clipboard` |
-| `sqlite3` CLI | 调试用（可选） | `sudo apt install sqlite3` |
+| 依赖 | 说明 |
+|---|---|
+| Erlang/OTP | ≥ 26（本项目在 OTP 29 测试通过） |
+| rebar3 | ≥ 3.20 |
+| `xclip` **或** `wl-clipboard` | 二者装其一即可，代码自动探测 |
+| `sqlite3` CLI | 可选，调试用 |
 
-**X11 与 Wayland 只需安装其中之一**，代码会自动探测。判断方式：`init/1` 里优先探测 `wl-copy` / `wl-paste`，找不到就回退到 `xclip`。
+Debian/Ubuntu 一键：
 
-### 编译期依赖
+```bash
+sudo apt install xclip wl-clipboard sqlite3
+```
 
-- C 编译器（`gcc` 或 `clang`）
-- `make`
-- SQLite amalgamation 源码（见下一节）
+macOS 用户注意：当前实现只支持 Linux。macOS 需要自行在 `clipboard_tools.erl` 里加 `pbcopy` / `pbpaste` 分支。
+
+### 编译期
+
+- gcc 或 clang
+- make
+- SQLite amalgamation 源码（见下文）
 
 ---
 
 ## 🚀 构建与运行
 
-### 1. 下载 SQLite amalgamation
-
-SQLite 官方提供单文件发行版，放进 `c_src/`：
+### 1. 获取 SQLite amalgamation
 
 ```bash
 cd c_src
@@ -138,23 +162,20 @@ mv sqlite-amalgamation-3460000/sqlite3.h .
 rm -rf sqlite-amalgamation-3460000*
 ```
 
-这样 NIF 就**完全自包含**，不依赖系统安装的 SQLite。
-
 ### 2. 编译
 
 ```bash
 rebar3 compile
 ```
 
-`rebar.config` 里配置了 `pre_hooks`，会自动调用 `make -C c_src` 编译出 `priv/clipboard_sqlite_nif.so`。
+rebar3 会自动调用 `make -C c_src` 编译 NIF 到 `priv/`。
 
-若想单独调试 C 编译：
+手动只编 NIF：
 
 ```bash
-cd c_src
-make debug      # 打印推导出的 include 路径
-make            # 只编译 NIF
-make clean      # 清理产物
+make -C c_src debug   # 打印推导出来的 erts include 路径
+make -C c_src         # 只编译 NIF
+make -C c_src clean   # 清理
 ```
 
 ### 3. 启动
@@ -163,448 +184,679 @@ make clean      # 清理产物
 rebar3 shell
 ```
 
-会启动 `clipboard_server` 应用，自动拉起监督树。
+启动日志应包含：
+
+```
+clipboard database opened at /home/<user>/.local/share/clipboard_server/clipboard.db
+clipboard watcher started: tool=/usr/bin/xclip ... poll=800ms baseline=0 bytes
+clipboard HTTP server listening on http://0.0.0.0:8080/
+```
+
+### 4. 打开前端
+
+浏览器访问 [http://localhost:8080](http://localhost:8080) 即可。
 
 ---
 
-## 💻 使用示例
+## 📚 Erlang API
 
-在 `rebar3 shell` 的 Eshell 中：
+在 `rebar3 shell` 里直接调用。
+
+### 剪贴板读写
 
 ```erlang
-%% 写入剪贴板（同时异步落库）
-clipboard_server:set_text("hello world").
-clipboard_server:set_text("goodbye moon").
-clipboard_server:set_text("hello erlang").
+%% 写入系统剪贴板（watcher 会在下一轮把它捕获并落库）
+clipboard_server:set_text("hello").
+clipboard_server:set_text(<<"也支持二进制"/utf8>>).
 
-%% 读取当前剪贴板内容
+%% 读取当前剪贴板
 clipboard_server:get_text().
-%% => {ok, "hello erlang"}
+%% => {ok, "当前文本"}
+%% => {error, no_text_data}     剪贴板为空
+%% => {error, non_text_clipboard} 剪贴板里不是文本（如图片）
+```
 
-%% 列出全部历史（最新在前）
+### 历史查询
+
+```erlang
+%% 全部历史，最新在前
 clipboard_server:list_history().
-%% => {ok, [#{id => 3, content => "hello erlang", created_at => 1760000000000},
-%%          #{id => 2, content => "goodbye moon", created_at => ...},
-%%          #{id => 1, content => "hello world", created_at => ...}]}
+%% => {ok, [#{id => 3, content => "...", created_at => 1760000000000}, ...]}
 
-%% 只看最近 2 条
-clipboard_server:list_history(2).
+%% 最近 N 条
+clipboard_server:list_history(5).
 
-%% grep 式模糊过滤（等价于 LIKE '%hello%'）
-clipboard_server:search_history("hello").
-%% => {ok, [#{id => 3, ...}, #{id => 1, ...}]}
+%% 模糊搜索（支持二进制和 list）
+clipboard_server:search_history("历史").
+clipboard_server:search_history(<<"%历史">>).
 
-%% 通配符可用：% 匹配任意串，_ 匹配单个字符
-clipboard_server:search_history("hello%erlang").
-
-%% 清空历史
+%% 清空
 clipboard_server:clear_history().
 ```
 
+### 监视器状态
+
+```erlang
+%% 最近一次检测到的剪贴板内容（原始二进制）
+clipboard_watcher:get_last().
+%% => <<"...">>
+
+%% 运行统计
+clipboard_watcher:get_stats().
+%% => #{poll_ms              => 800,
+%%      consecutive_failures => 0,
+%%      total_polls          => 1234,
+%%      total_changes        => 42,
+%%      total_skipped        => 3,
+%%      baseline_bytes       => 8}
+```
+
+### 订阅变化事件（pg 组）
+
+在任意 Erlang 进程里：
+
+```erlang
+pg:join(clipboard_events, self()).
+
+%% 每当剪贴板有新的文本内容，就会收到消息：
+receive
+    {clipboard_changed, BinData} -> io:format("变化: ~p~n", [BinData])
+end.
+```
+
+这一层是未来接 SSE / WebSocket 实时推送的入口。
+
 ---
 
-## 💾 数据存储位置
+## 💾 数据存储
 
-### 默认路径
+### 路径
+
+默认：
 
 ```
 ~/.local/share/clipboard_server/clipboard.db
 ```
 
-对你当前用户而言，完整路径是：
+解析优先级：
 
-```
-/home/etcix/.local/share/clipboard_server/clipboard.db
-```
+1. 环境变量 `CLIPBOARD_DATA_DIR`（若设置则直接用）
+2. `$XDG_DATA_HOME/clipboard_server/clipboard.db`
+3. `$HOME/.local/share/clipboard_server/clipboard.db`
 
-### 路径解析优先级
-
-数据库路径由 `clipboard_store:db_path/0` 决定，按以下顺序解析：
-
-1. **环境变量 `CLIPBOARD_DATA_DIR`** —— 如果设置了，直接使用该目录下的 `clipboard.db`。
-2. **环境变量 `XDG_DATA_HOME`** —— 未设置时回退到 `$HOME/.local/share`。
-3. 最终路径为 `<Base>/clipboard_server/clipboard.db`。
-
-### 在 Erlang shell 中查看实际路径
+### 在 shell 里查看实际路径
 
 ```erlang
-%% 方式 1：直接从 store 的 State 里读（最准确）
 sys:get_state(clipboard_store).
-%% => #{db => #Ref<0...>, path => "/home/etcix/.local/share/clipboard_server/clipboard.db"}
-
-%% 方式 2：查看环境变量
-os:getenv("CLIPBOARD_DATA_DIR").
-os:getenv("XDG_DATA_HOME").
-os:getenv("HOME").
+%% => #{db => #Ref<...>, path => "/home/etcix/.local/share/clipboard_server/clipboard.db"}
 ```
 
-### 自定义存储位置
-
-```bash
-# 临时指定（单次运行）
-CLIPBOARD_DATA_DIR=/tmp/clip_data rebar3 shell
-
-# 永久生效（写入 shell 配置）
-export CLIPBOARD_DATA_DIR="$HOME/data/clipboard"
-```
-
-### 目录创建
-
-`clipboard_store:init/1` 会在打开数据库之前调用 `filelib:ensure_dir/1`，自动创建缺失的目录层级，无需手动 `mkdir`。
-
----
-
-## 🗃️ 数据库结构
-
-### 表定义
+### 表结构
 
 ```sql
 CREATE TABLE IF NOT EXISTS clipboard_history (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     content    TEXT    NOT NULL,
-    created_at INTEGER NOT NULL       -- Unix 毫秒时间戳
+    created_at INTEGER NOT NULL   -- Unix 毫秒时间戳
 );
 ```
 
-### 字段说明
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `id` | INTEGER | 自增主键，每条记录唯一 |
-| `content` | TEXT | 剪贴板文本内容，UTF-8 存储 |
-| `created_at` | INTEGER | 写入时刻的 Unix 毫秒时间戳（`erlang:system_time(millisecond)`） |
-
-### 用 sqlite3 CLI 查看
+### 用 sqlite3 直接查
 
 ```bash
-DB=/home/etcix/.local/share/clipboard_server/clipboard.db
+DB=~/.local/share/clipboard_server/clipboard.db
 
-# 查看表结构
+# 表结构
 sqlite3 "$DB" ".schema"
 
-# 查看所有记录（毫秒时间戳转换成本地可读时间）
+# 全部记录（毫秒时间戳转本地时间）
 sqlite3 -header -column "$DB" \
   "SELECT id, content,
-          datetime(created_at/1000, 'unixepoch', 'localtime') AS created
-   FROM clipboard_history
-   ORDER BY created_at DESC;"
+          datetime(created_at/1000, 'unixepoch', 'localtime') AS ts
+   FROM clipboard_history ORDER BY created_at DESC;"
 
-# 用 LIKE 验证 search_history 的等价行为
-sqlite3 "$DB" \
-  "SELECT id, content FROM clipboard_history WHERE content LIKE '%hello%';"
+# 检查某条的原始字节
+sqlite3 "$DB" "SELECT id, hex(content) FROM clipboard_history LIMIT 5;"
 
-# 统计记录条数
+# 模糊查询（等价于 search_history）
+sqlite3 "$DB" "SELECT id, content FROM clipboard_history WHERE content LIKE '%历史%';"
+
+# 统计
 sqlite3 "$DB" "SELECT COUNT(*) FROM clipboard_history;"
 
-# 手动清空
-sqlite3 "$DB" "DELETE FROM clipboard_history;"
+# 清空
+sqlite3 "$DB" "DELETE FROM clipboard_history; VACUUM;"
 ```
 
-### 数据库文件维护
+### 自定义位置
 
 ```bash
-# 查看文件大小
-ls -lh "$DB"
+# 临时
+CLIPBOARD_DATA_DIR=/tmp/clip_data rebar3 shell
 
-# 压缩（回收删除记录后残留的空洞）
-sqlite3 "$DB" "VACUUM;"
-
-# 备份
-cp "$DB" "$DB.bak.$(date +%F)"
+# 永久（shell 配置里）
+export CLIPBOARD_DATA_DIR="$HOME/data/clipboard"
 ```
 
 ---
 
-## 🔌 NIF 接口说明
+## 🌐 HTTP API
 
-所有 NIF 实现在 `c_src/clipboard_sqlite_nif.c`，通过 `src/clipboard_sqlite_nif.erl` 加载。全部声明为 `ERL_NIF_DIRTY_JOB_IO_BOUND`，运行在 I/O 脏调度器上。
+服务默认监听 `0.0.0.0:8080`。所有响应均为 JSON，统一格式：
 
-| Erlang 函数 | 参数 | 返回 | 说明 |
+```json
+{ "ok": true, "data": [...] }
+{ "ok": true }
+{ "ok": false, "error": "错误说明" }
+```
+
+### 端点总览
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/` | 前端页面（`priv/index.html`） |
+| `GET` | `/api/history` | 列出历史（支持 `?limit=N`） |
+| `GET` | `/api/history/search` | 模糊搜索（`?q=pattern`） |
+| `GET` | `/api/clipboard` | 读取当前系统剪贴板 |
+| `POST` | `/api/clipboard` | 写入剪贴板，body `{"text":"..."}` |
+| `DELETE` | `/api/clear` | 清空全部历史 |
+| `OPTIONS` | `*` | CORS 预检 |
+
+### `GET /api/history`
+
+列出全部历史，最新在前。
+
+**查询参数**
+
+| 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `open/1` | `PathBin :: binary()` | `{ok, Ref}` \| `{error, Msg}` | 打开/创建数据库文件，返回资源引用 |
-| `close/1` | `Db :: reference()` | `ok` \| `{error, Msg}` | 显式关闭连接（GC 也会自动关闭） |
-| `exec/2` | `Db, SqlBin` | `ok` \| `{error, Msg}` | 执行无参数 SQL（DDL、PRAGMA 等） |
-| `insert/3` | `Db, ContentBin, Ts` | `ok` \| `{error, Msg}` | 插入一行（内容 + 时间戳） |
-| `list_all/1` | `Db` | `[{Id, Bin, Ts}]` \| `{error, Msg}` | 列出全部记录 |
-| `list_limit/2` | `Db, N` | `[{Id, Bin, Ts}]` \| `{error, Msg}` | 列出最近 N 条 |
-| `search/2` | `Db, PatternBin` | `[{Id, Bin, Ts}]` \| `{error, Msg}` | LIKE 模糊搜索 |
-| `clear/1` | `Db` | `ok` \| `{error, Msg}` | 清空表 |
+| `limit` | integer | 0 | 返回最近 N 条，0 表示全部 |
 
-**返回值约定**：
-- 内容一律返回 **二进制**，Erlang 侧负责转换成字符串（保证 UTF-8 正确）。
-- 元组格式为 `{Id :: integer(), Content :: binary(), CreatedAt :: integer()}`。
-- 出错时返回 `{error, Reason}`，`Reason` 是字符串（`string()` 类型）。
+**示例**
+
+```bash
+# 全部
+curl -s http://localhost:8080/api/history | jq
+
+# 最近 5 条
+curl -s 'http://localhost:8080/api/history?limit=5' | jq
+```
+
+**响应**
+
+```json
+{
+  "ok": true,
+  "data": [
+    {"id": 42, "content": "hello world", "created_at": 1760000000000},
+    {"id": 41, "content": "剪贴板历史",   "created_at": 1759999900000}
+  ]
+}
+```
+
+### `GET /api/history/search`
+
+对 `content` 做 SQL `LIKE '%q%'` 过滤。**`q` 支持 `%` 和 `_` 通配符**。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `q` | string | 搜索关键字，必填 |
+
+**示例**
+
+```bash
+# 包含 hello 的记录
+curl -s 'http://localhost:8080/api/history/search?q=hello' | jq
+
+# 以「历史」结尾（% 是通配符，URL 里编码为 %25）
+curl -s 'http://localhost:8080/api/history/search?q=%25历史' | jq
+
+# 以「剪」开头
+curl -s 'http://localhost:8080/api/history/search?q=剪%25' | jq
+
+# 「剪」+ 任意 3 个字符
+curl -s 'http://localhost:8080/api/history/search?q=剪___' | jq
+
+# 匹配所有非空记录
+curl -s 'http://localhost:8080/api/history/search?q=%25' | jq
+```
+
+**响应**：与 `/api/history` 相同。
+
+### `GET /api/clipboard`
+
+读取当前系统剪贴板。
+
+**示例**
+
+```bash
+curl -s http://localhost:8080/api/clipboard | jq
+```
+
+**响应**
+
+```json
+{ "ok": true, "text": "当前剪贴板的内容" }
+{ "ok": false, "error": "no_text_data" }
+```
+
+### `POST /api/clipboard`
+
+写入系统剪贴板。写入后由 watcher 异步落库，前端刷新即可看到。
+
+**请求体**
+
+```json
+{ "text": "要写入的内容" }
+```
+
+**示例**
+
+```bash
+curl -s -X POST http://localhost:8080/api/clipboard \
+     -H 'content-type: application/json' \
+     -d '{"text":"from curl"}' | jq
+```
+
+**响应**
+
+```json
+{ "ok": true }
+```
+
+### `DELETE /api/clear`
+
+清空全部历史。
+
+```bash
+curl -s -X DELETE http://localhost:8080/api/clear | jq
+```
+
+**响应**
+
+```json
+{ "ok": true }
+```
+
+### 端口配置
+
+默认 `8080`。修改方式：
+
+**方式 1：`config/sys.config`**
+
+```erlang
+[
+  {clipboard_server, [
+      {http_port, 9000},
+      {watcher_poll_ms, 800}
+  ]}
+].
+```
+
+**方式 2：shell 里动态设置（临时）**
+
+```erlang
+application:set_env(clipboard_server, http_port, 9000).
+```
+
+改完后重启应用生效。
 
 ---
 
-## 📚 Erlang API 参考
+## 🖥️ 前端使用与测试
 
-### `clipboard_server`
+前端是一个单文件 `priv/index.html`，无框架、无外部依赖，由 Erlang 直接返回。打开 [http://localhost:8080](http://localhost:8080) 即可。
 
-面向调用方的主要接口，封装了剪贴板读写和历史查询。
+### 界面结构
 
-```erlang
-%% 写入系统剪贴板，并把内容异步写入历史库
--spec set_text(string()) -> ok | {error, term()}.
-
-%% 读取系统剪贴板当前文本
--spec get_text() -> {ok, string()} | {error, term()}.
-
-%% 列出全部历史（最新在前）
--spec list_history() -> {ok, [map()]} | {error, term()}.
-
-%% 列出最近 N 条历史
--spec list_history(non_neg_integer()) -> {ok, [map()]} | {error, term()}.
-
-%% 模糊搜索历史
--spec search_history(string()) -> {ok, [map()]} | {error, term()}.
-
-%% 清空历史
--spec clear_history() -> ok | {error, term()}.
+```
+┌──────────────────────────────────────────────────────┐
+│  📋 剪贴板历史                                        │
+│  ┌────────────────────────────────┐  ┌────┐ ┌────┐  │
+│  │ 输入关键字过滤…                 │  │刷新│ │清空│  │
+│  └────────────────────────────────┘  └────┘ └────┘  │
+│  示例: hello  %历史  剪%  剪___  http%com  error  %  清空 │
+├──────────────────────────────────────────────────────┤
+│  共 N 条记录                                          │
+│  ┌──────────────────────────────────────────────┐    │
+│  │ 内容...                     #3 · 12:34:56   │    │
+│  │                                     [复制]    │    │
+│  └──────────────────────────────────────────────┘    │
+│  ...                                                  │
+└──────────────────────────────────────────────────────┘
 ```
 
-### `clipboard_store`
+### 功能测试
 
-持久化层，通常不直接调用，但调试时可用。
+#### 测试 1：自动捕获系统剪贴板
+
+**步骤**
+
+1. 打开任意编辑器（浏览器、记事本、终端都可以），复制一段中文文本，例如 `测试中文内容`。
+2. 回到浏览器，**不要点刷新**，等 2~3 秒。
+3. 前端每 2 秒自动刷新一次，新记录会自动出现在列表顶部。
+
+**预期**
+
+- 列表顶部出现刚才复制的内容。
+- 时间戳是刚刚复制的时刻。
+- 内容显示为**正常的中文**，不是乱码。
+
+**排查**
+
+如果没看到新记录：
 
 ```erlang
--spec insert(string()) -> ok | {error, term()}.
--spec list_all() -> {ok, [map()]} | {error, term()}.
--spec list_all(non_neg_integer()) -> {ok, [map()]} | {error, term()}.
--spec search(string()) -> {ok, [map()]} | {error, term()}.
--spec clear() -> ok | {error, term()}.
+%% 在 shell 里检查 watcher 是否活着
+whereis(clipboard_watcher).
+clipboard_watcher:get_stats().
+%% total_changes 应该增加
 ```
 
-### 返回的 map 结构
+#### 测试 2：相同内容不重复落库
+
+**步骤**
+
+1. 复制 `dup test`。
+2. 等 2 秒。
+3. 再复制一次 `dup test`。
+4. 等 2 秒。
+
+**预期**
+
+列表里**只有一条** `dup test`。
+
+后台日志（debug 级别）会显示：
+
+```
+clipboard_store compare: ... equal=true
+clipboard_store: skip duplicate (8 bytes)
+```
+
+**打开 debug 日志**
 
 ```erlang
-#{id         => integer(),       %% 记录 ID
-  content    => string(),        %% 剪贴板文本内容
-  created_at => integer()}       %% Unix 毫秒时间戳
+logger:set_primary_config(level, debug).
 ```
+
+#### 测试 3：带换行、空格的内容视为相同
+
+**步骤**
+
+1. 复制 `hello`（不带换行）。
+2. 等 2 秒。
+3. 复制 `hello\n`（末尾换行）—— 手动在编辑器里敲一个回车再复制。
+4. 等 2 秒。
+5. 复制 `hello `（末尾空格）。
+6. 等 2 秒。
+
+**预期**
+
+列表里只有一条 `hello`。归一化逻辑会忽略首尾空白和零宽字符。
+
+#### 测试 4：截图粘贴不崩溃
+
+**步骤**
+
+1. 用系统截图工具（GNOME Screenshot、Flameshot、Spectacle 等）截一张图。
+2. 选择"复制到剪贴板"。
+3. 等 2 秒。
+4. 观察前端列表和 shell 日志。
+
+**预期**
+
+- 前端列表**没有新记录**（图片内容被跳过）。
+- shell 不崩溃，`clipboard_watcher:get_stats()` 的 `total_skipped` 加 1。
+- 随后再复制一段文本，能正常落库。
+
+**排查**
+
+```erlang
+clipboard_watcher:get_stats().
+%% => #{total_skipped => 1, ...}
+```
+
+#### 测试 5：grep 示例 pill 点击
+
+前端搜索框下方有一排示例 pill，每个都演示一种通配符用法：
+
+| Pill | 匹配规则 | 演示场景 |
+|---|---|---|
+| `hello` | 包含 `hello` | 普通子串搜索 |
+| `%历史` | 以「历史」结尾 | `%` 后缀匹配 |
+| `剪%` | 以「剪」开头 | `%` 前缀匹配 |
+| `剪___` | 「剪」+ 任意 3 字符 | `_` 单字符匹配 |
+| `http%com` | `http` 与 `com` 之间任意内容 | 匹配 URL |
+| `error` | 包含 `error` | 日志搜索 |
+| `%` | 所有非空记录 | 通配一切 |
+| `清空` | 空查询 | 显示全部 |
+
+**步骤**
+
+1. 先准备数据：复制几段内容，比如 `hello world`、`剪贴板历史`、`https://example.com`、`error: timeout`。
+2. 依次点击每个 pill，观察过滤结果和 `匹配 "xxx" 的记录：N 条` 提示。
+3. hover 每个 pill 会显示 tooltip 说明用途。
+
+**预期**
+
+- 点击 pill 后，搜索框内容自动替换为对应查询，列表即时过滤。
+- `清空` pill 显示全部记录。
+- 匹配的关键字在列表里有黄色高亮。
+
+#### 测试 6：手动搜索
+
+**步骤**
+
+1. 在搜索框输入 `历史`，观察列表过滤。
+2. 输入 `%历史`，观察结果是否只保留以"历史"结尾的。
+3. 输入 `剪___`，观察是否匹配 4 个字符、以"剪"开头的内容。
+4. 输入不存在的关键字 `zzz_not_exist`，列表应显示"暂无记录"。
+
+**预期**
+
+- 输入有 200ms 防抖，打字时不频繁请求。
+- 高亮正确显示匹配部分。
+
+#### 测试 7：一键复制回剪贴板
+
+**步骤**
+
+1. 找到任意一条历史。
+2. 点击右侧「复制」按钮。
+3. 打开任意编辑器，粘贴（Ctrl+V）。
+
+**预期**
+
+- 页面底部弹出 toast "已写回剪贴板"。
+- 粘贴出来的就是这条内容。
+- 因为内容不变，**不会新增一条历史**（去重生效）。
+
+#### 测试 8：清空历史
+
+**步骤**
+
+1. 点击右上角红色「清空」按钮。
+2. 确认对话框点"确定"。
+
+**预期**
+
+- 弹出 toast "已清空"。
+- 列表显示"暂无记录"。
+- 用 `sqlite3` 命令行查一下，表为空。
+
+#### 测试 9：跨浏览器刷新持久化
+
+**步骤**
+
+1. 复制几段内容。
+2. 关闭浏览器标签页。
+3. 在 shell 里 `q().` 退出，再 `rebar3 shell` 重启。
+4. 重新打开 `http://localhost:8080`。
+
+**预期**
+
+所有历史仍然存在（数据在 SQLite 里）。
+
+#### 测试 10：HTTP API 和前端一致性
+
+在终端里：
+
+```bash
+# 用 curl 写入
+curl -s -X POST http://localhost:8080/api/clipboard \
+     -H 'content-type: application/json' \
+     -d '{"text":"from curl"}' | jq
+
+# 等 2 秒，然后查看
+curl -s http://localhost:8080/api/history?limit=3 | jq
+```
+
+**预期**
+
+- curl 写入的内容，2 秒内出现在历史里。
+- 浏览器刷新后也能看到。
+
+### 前端调试技巧
+
+打开浏览器开发者工具（F12）：
+
+- **Console**：查看 JS 错误。
+- **Network**：查看每个 `/api/*` 请求的响应，定位 400/500 问题。
+- **Application → Local Storage**：暂无使用，可自行扩展。
+
+如果页面显示"加载失败：HTTP 500"，切到 Network 看具体哪个请求失败，然后去 shell 日志里查对应的 CRASH REPORT。
 
 ---
 
-## 🐞 调试指南
+## 🐞 调试与排查
 
-### 1. 查看 gen_server 的 State
+### 常用 shell 命令
 
 ```erlang
-%% 看 store 的 State（可确认数据库路径）
+%% 应用是否在运行
+application:which_applications().
+
+%% 进程是否存活
+whereis(clipboard_store).
+whereis(clipboard_server).
+whereis(clipboard_watcher).
+whereis(clipboard_http).
+
+%% 监督树状态
+supervisor:which_children(clipboard_server_sup).
+
+%% 查看 State
 sys:get_state(clipboard_store).
+sys:get_state(clipboard_watcher).
 
-%% 看 server 的 State（可确认当前用的剪贴板工具路径）
-sys:get_state(clipboard_server).
-
-%% 看进程完整状态（消息队列、链接进程等）
-sys:get_status(clipboard_server).
-```
-
-### 2. 打开 gen_server 事件追踪
-
-```erlang
-%% 打开 store 的 trace，所有 call / cast / info 都会打印到终端
+%% 打开 trace，观察内部消息
 sys:trace(clipboard_store, true).
-
-%% 触发一次
 clipboard_server:set_text("trace test").
-%% 终端会输出类似：
-%% *DBG* clipboard_store got cast {insert,<<"trace test">>}
-%% *DBG* clipboard_store new state #{db => ...}
-
-%% 关闭
 sys:trace(clipboard_store, false).
 ```
 
-### 3. 确认 NIF 已加载
+### 常见问题
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `{noproc, ...}` | 进程已崩溃且 supervisor 放弃重启 | 重启 shell；查前面的 CRASH REPORT |
+| `nif_not_loaded` | `.so` 未编译或路径不对 | `ls priv/`，重跑 `rebar3 compile` |
+| 前端"加载失败：HTTP 500" | 后端某处异常 | 查 shell 里最近的 CRASH REPORT |
+| 搜中文 500 | `binary_to_list` 导致的双重编码 | 确保 HTTP handler 传二进制而非 list |
+| 截图后服务崩溃 | 非 UTF-8 内容被当文本处理 | 确保 watcher 里做了 `is_valid_utf8` 判断 |
+| 中文乱码 | 历史遗留数据是旧代码写的 | `clipboard_server:clear_history()` 后重试 |
+| `xclip: command not found` | 未安装剪贴板工具 | `sudo apt install xclip wl-clipboard` |
+| 端口 8080 被占 | 其他服务占用 | 改 `config/sys.config` 里的 `http_port` |
+
+### 打开 debug 日志
 
 ```erlang
-%% 应返回 {module, clipboard_sqlite_nif}
-code:which(clipboard_sqlite_nif).
-
-%% 检查 .so 文件存在
-filelib:is_file("priv/clipboard_sqlite_nif.so").
-%% 或在 shell 里：
-%% $ ls -la priv/
+logger:set_primary_config(level, debug).
 ```
 
-### 4. 启动 Observer（需图形环境）
+能看到：
 
-```erlang
-observer:start().
-```
+- 每次剪贴板变化的字节数
+- 去重比较的详细信息
+- NIF 的插入/查询日志
 
-可视化查看监督树、进程状态、消息队列长度、内存占用。
+### 用 sqlite3 直接验证数据
 
-### 5. 用 dbg 追踪调用链
-
-```erlang
-%% 追踪 store 和 server 的所有调用
-dbg:tracer().
-dbg:p(all, c).
-dbg:tpl(clipboard_store, x).
-dbg:tpl(clipboard_server, x).
-
-%% 触发一次，观察调用链
-clipboard_server:set_text("dbg test").
-
-%% 停止
-dbg:ctpl(), dbg:stop().
-```
-
-### 6. 绕过 server 直接测 store
-
-用来快速区分问题是出在剪贴板层还是数据库层：
-
-```erlang
-clipboard_store:insert("direct insert").
-clipboard_store:list_all().
-clipboard_store:search("direct").
-```
-
-### 7. 加日志（推荐，长期方案）
-
-在 `clipboard_store:init/1` 里加一行：
-
-```erlang
-logger:info("clipboard database opened at ~ts", [DbPath]),
-```
-
-启动时打开日志：
+怀疑某条数据有异常时，用 `hex()` 看原始字节：
 
 ```bash
-rebar3 shell --eval 'logger:set_primary_config(level, info).'
+DB=~/.local/share/clipboard_server/clipboard.db
+sqlite3 "$DB" "SELECT id, quote(content), hex(content) 
+               FROM clipboard_history ORDER BY id DESC LIMIT 5;"
 ```
 
-这样数据库路径一目了然。
+`quote()` 会把换行、空格等不可见字符转义显示。`hex()` 直接给出十六进制字节，末尾多一个 `0A` 就是多了一个换行符。
 
 ---
 
-## 🔧 常见问题排查
-
-| 现象 | 可能原因 | 解决方式 |
-|---|---|---|
-| `erl_nif.h: No such file or directory` | Makefile 里 erts include 路径推导失败 | 使用 `code:root_dir()` + `erlang:system_info(version)` 组合推导，或 `make debug` 检查 |
-| `nif_not_loaded` | `.so` 未编译或路径不对 | 检查 `priv/clipboard_sqlite_nif.so`，确认 `rebar3 compile` 成功 |
-| `{noproc, {gen_server, call, [clipboard_store, ...]}}` | store 未启动或已崩溃 | 查看 shell 顶部 CRASH REPORT，检查 `init/1` 是否 `{stop, ...}` |
-| `{error, "unable to open database file"}` | 数据目录不可写 | `ls -la ~/.local/share/clipboard_server/`，检查权限 |
-| `{error, "database is locked"}` | 有另一进程持有锁 | `lsof ~/.local/share/clipboard_server/clipboard.db` |
-| `{error, {missing_tool, ...}}` | 未安装 xclip 或 wl-clipboard | `sudo apt install xclip wl-clipboard` |
-| `set_text` 返回 `{error, {external_tool_failed, N}}` | 外部剪贴板工具执行失败 | 手工运行相同命令看报错 |
-| `search_history/1` 返回 `{error, ...}` | NIF 里 SQL 出错 | 用 `sqlite3` CLI 手工跑同 SQL 对比 |
-| `.so` 编译后行为未变 | NIF 加载后无法热替换 | **必须重启 shell** |
-| `'catch ...' is deprecated` 告警 | OTP 29 弃用了前置 catch | 用 `try ... catch ... end` 替代 |
-| `{wx, unknown_env}` | 使用了 wx 库且无图形环境 | 本项目已弃用 wx，改用 xclip / wl-copy |
-| 无头环境（SSH）无法读写剪贴板 | xclip 需要 X11 / Wayland 环境 | 本项目无法在纯文本终端使用剪贴板 |
-
----
-
-## 🧠 设计决策说明
+## 🧠 设计说明
 
 ### 为什么不用 `wx` 库？
 
-`wxClipboard` 依赖 `wxWidgets`，它需要可用的图形环境。在 SSH 或服务器环境里，`wx` 应用无法启动，会报 `{wx, unknown_env}`。改用 `xclip` / `wl-copy` 后，不依赖图形库，行为更稳定。
+`wxClipboard` 依赖 `wxWidgets` 图形库，在 SSH 或服务器环境里会报 `{wx, unknown_env}`。`xclip` / `wl-copy` 不依赖图形栈，稳定得多。
 
-### 为什么用自研 NIF 而不用现成的 SQLite 绑定？
+### 为什么自研 SQLite NIF？
 
-第三方绑定往往一次性提供大量 API，是个“黑盒”，且引入了额外的维护负担。本项目只需 8 个核心函数，自研 NIF 让代码完全可控、可审计、无意外依赖。代价是需要自己处理内存安全和跨平台编译。
+第三方绑定往往是"黑盒"，且引入大量不需要的 API。自研 NIF 只实现 8 个核心函数，代码完全可控、可审计。代价是需自己保证内存安全。
 
-### 为什么所有 NIF 都标脏调度器？
+### 为什么用脏调度器？
 
-SQLite 操作涉及磁盘 I/O，可能超过 1 毫秒。如果放在普通调度器上，会阻塞 Erlang VM 的其他进程，导致延迟尖峰。脏 I/O 调度器是 OTP 21+ 引入的独立线程池，专为这类操作设计。
+SQLite 磁盘 I/O 可能超过 1ms。若运行在普通调度器上，会阻塞 Erlang VM 的其他进程。所有 NIF 都声明为 `ERL_NIF_DIRTY_JOB_IO_BOUND`，由 OTP 的 I/O 线程池执行。
 
-### 为什么写入剪贴板后不等待 `exit_status`？
+### 为什么 watcher 每 800ms 轮询？
 
-`xclip` / `wl-copy` 会**驻留后台**持有剪贴板所有权，等待其他程序粘贴。它们不会因为 stdin 关闭而立刻退出。若在 `do_set_text/1` 里等 `exit_status`，会永远等不到并超时。因此发完数据、关闭 stdin，直接返回 `ok`。
+Linux 剪贴板**没有**统一的"内容变化"通知机制。`wl-paste --watch` 只支持 Wayland；X11 没有可靠的事件接口。轮询是唯一跨环境通用的方案。800ms 的间隔对 CPU 几乎无感，响应也够快。
 
-### 为什么用资源对象管理数据库连接？
+### 为什么要归一化去重？
 
-`enif_alloc_resource` 创建的资源对象由 Erlang GC 管理。当 Erlang 侧不再持有 `DbRef`，NIF 析构函数 `db_resource_dtor` 会被自动调用，关闭 `sqlite3*`。这避免了 C 侧连接泄漏。
+用户从不同来源复制同一段文本，字节层面可能不同：末尾带不带换行、有没有零宽空格、有没有首尾空白。归一化后比较能避免这些"视觉上相同"的重复。
 
-### 为什么读返回二进制而不是字符串？
+### 为什么要区分文本 vs 非文本？
 
-`content` 列可能包含 UTF-8 多字节字符（中文、emoji）。NIF 层用 `enif_make_binary` 返回原始字节，Erlang 侧用 `unicode:characters_to_list/1` 转成字符串。这保证了任意文本内容的正确性。
+截图、复制的图片、从文件管理器复制的文件路径等，在剪贴板里都是二进制数据。直接把二进制塞进 SQLite 的 TEXT 字段，会导致 UTF-8 解码失败、前端乱码、甚至服务崩溃。用 `unicode:characters_to_binary/3` 做合法性检查，非法就直接跳过。
+
+### 为什么全程用二进制？
+
+Erlang 的字符串是 codepoint 列表，二进制是字节数组。**跨边界（C NIF、HTTP、SQLite）时用二进制**能避免一系列编码陷阱：`binary_to_list` 把字节展开成 codepoint、`characters_to_binary` 又把 codepoint 编码成多字节 UTF-8，一来一回就是双重编码。二进制全程保持字节原样，各层只需在**出口**（前端、API 响应）做一次 UTF-8 编码。
 
 ### 为什么搜索不转义 `%` 和 `_`？
 
-`search_history/1` 直接把用户输入拼成 `%pattern%`。用户主动输入 `%` 或 `_` 时，会按 SQL 通配符语义解释（`%` 匹配任意串，`_` 匹配单字符）。这是有意为之，方便用户做更灵活的过滤。若需严格字面匹配，可修改 `nif_search` 转义这两个字符。
+有意的：允许用户主动使用通配符做更灵活的过滤。如果用户只想字面匹配，可以改成在 `nif_search` 里对 `%` 和 `_` 做转义。
 
-### 为什么数据库操作要串行化？
+### 为什么落库入口要统一到 watcher？
 
-SQLite 连接默认不是线程安全的。所有 SQL 都通过 `clipboard_store` 这个 `gen_server` 串行执行，最简单的保护方式，也符合剪贴板场景的低并发特性。如需高并发，可在 `open/1` 后启用 WAL 模式并使用连接池。
+如果 `set_text/1` 也直接落库，就会和 watcher 的捕获逻辑重复。统一让 watcher 从剪贴板读出来再落库，保证：
+
+- API 写入和手动复制走同一条路径。
+- 去重逻辑只在一个地方。
+- 未来加"剪贴板历史监听"扩展时不用改两处。
+
+代价：API 写入后需要等一个轮询周期才落库（最多 800ms）。对剪贴板历史场景完全够用。
 
 ---
 
 ## 🚧 扩展建议
 
-### 1. 加 HTTP / JSON 前端
-
-用 `cowboy` 暴露 REST 接口：
-
-- `POST /api/clipboard` → `clipboard_server:set_text/1`
-- `GET /api/history?q=xxx&limit=100` → `clipboard_server:search_history/1` 或 `list_history/1`
-- `DELETE /api/history` → `clipboard_server:clear_history/0`
-
-`{ok, [map()]}` 返回值可直接用 `jsx` / `jsone` 序列化为 JSON。
-
-### 2. 加 CLI 工具
-
-写一个 escript，调用上述 Erlang API：
-
-```bash
-clip list
-clip search "hello"
-clip clear
-```
-
-### 3. 全文搜索（FTS5）
-
-SQLite 支持 FTS5 扩展。当 `content` 数据量大、需要分词或相关度排序时，可以：
-
-- 新建 FTS5 虚拟表 `clipboard_history_fts`，内容与主表同步。
-- 查询用 `MATCH` 替代 `LIKE`。
-- 需要重启 NIF 编译时启用 `SQLITE_ENABLE_FTS5` 宏。
-
-### 4. 剪贴板历史去重
-
-在 `insert` 前先查一下最新一条是否相同，避免重复文本反复入库。
-
-### 5. 支持图片剪贴板
-
-增加一个 NIF 函数 `insert_blob/3`，把图片二进制存入单独的 BLOB 表；`clipboard_server` 侧探测剪贴板 MIME 类型决定走文本还是图片路径。
-
-### 6. 配置热更新
-
-把数据库路径、保留条数上限等参数从环境变量迁移到 `sys.config` / `runtime.exs`，通过 `application:set_env/3` 动态调整。
-
-### 7. 打包成 release
-
-```bash
-rebar3 release
-```
-
-生成自带 Erlang 运行时的独立发行版，可以部署到未安装 Erlang 的机器上。注意把 SQLite amalgamation 一起打包。
-
-### 8. 跨平台支持
-
-当前只支持 Linux 的 X11 / Wayland。要支持 macOS / Windows：
-
-- **macOS**：`find_tools/0` 里加 `pbcopy` / `pbpaste` 分支。它们不驻留，写入逻辑更简单。
-- **Windows**：使用 PowerShell `Get-Clipboard` / `Set-Clipboard`，或调用 Win32 API。
+1. **实时推送**：用 `pg` 组 + Cowboy SSE 或 WebSocket，前端不再需要轮询。
+2. **分页**：`/api/history?offset=N&limit=M`。
+3. **删除单条**：`DELETE /api/history/:id`。
+4. **剪贴板历史去重策略**：可改成"任意位置重复都不插入"（用唯一索引），或"只保留最近 N 条"（定期清理）。
+5. **FTS5 全文搜索**：数据量大时改用 SQLite FTS5，支持分词和相关度排序。
+6. **图片剪贴板**：新增 BLOB 表和 `/api/clipboard/image` 端点。
+7. **macOS 支持**：在 `clipboard_tools.erl` 里加 `pbcopy` / `pbpaste` 分支。
+8. **鉴权**：加 `X-API-Token` 头校验，保护写接口。
+9. **发布为 release**：`rebar3 release` 打包成独立运行的系统，可部署到未装 Erlang 的机器。
+10. **前端框架化**：如果功能膨胀，`index.html` 可迁移到 Svelte / React + Vite，产物放回 `priv/`。
 
 ---
 
 ## 📄 许可
 
 本项目示例代码以 Apache-2.0 发布。SQLite amalgamation 遵循 SQLite 的公有领域许可。
-
----
-
-## 🔗 参考
-
-- [Erlang NIF 官方文档](https://www.erlang.org/doc/man/erl_nif.html)
-- [SQLite C Interface](https://www.sqlite.org/c3ref/intro.html)
-- [rebar3 官方文档](https://rebar3.org/)
-- [OTP 脏调度器](https://www.erlang.org/doc/man/erl_nif.html#ERL_NIF_DIRTY_JOB_IO_BOUND)
-- [xclip 项目](https://github.com/astrand/xclip)
-- [wl-clipboard 项目](https://github.com/bugaevc/wl-clipboard)
