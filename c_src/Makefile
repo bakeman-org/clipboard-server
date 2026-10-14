@@ -1,8 +1,11 @@
-ERTS_VSN      := $(shell erl -noshell -eval 'io:format("~s", [erlang:system_info(version)]), halt().')
-ERL_ROOT      := $(shell erl -noshell -eval 'io:format("~s", [code:root_dir()]), halt().')
-ERTS_INCLUDE  := $(ERL_ROOT)/erts-$(ERTS_VSN)/include
+# Pull precomputed Erlang paths (run ./env.sh first).
+-include config.mk
 
-# -Wall -Wextra -Wno-return-local-addr -Wno-unused-const-variable
+# Fail loudly if config.mk is missing/stale.
+ifeq ($(ERTS_INCLUDE),)
+$(error ERTS_INCLUDE is empty — run ./env.sh first to generate config.mk)
+endif
+
 CFLAGS   := -std=c11 -O2 -fPIC -I$(ERTS_INCLUDE)
 LDFLAGS  := -shared
 
@@ -18,9 +21,13 @@ $(TARGET): $(SOURCES)
 clean:
 	-rm -f $(TARGET)
 
-.PHONY: all clean
+.PHONY: all clean config debug
 
-__print_erlang_env:
+# Regenerate config.mk on demand (also outside Bear).
+config:
+	@./env.sh
+
+debug: config.mk
 	@echo "ERL_ROOT     = $(ERL_ROOT)"
 	@echo "ERTS_VSN     = $(ERTS_VSN)"
 	@echo "ERTS_INCLUDE = $(ERTS_INCLUDE)"
