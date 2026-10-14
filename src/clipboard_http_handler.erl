@@ -54,9 +54,10 @@ route(history, <<"GET">>, Req) ->
 %% GET /api/history/search?q=X
 route(search, <<"GET">>, Req) ->
     Qs = cowboy_req:parse_qs(Req),
+    %% 直接拿二进制，绝不做 binary_to_list
     Pattern = case lists:keyfind(<<"q">>, 1, Qs) of
-        {_, V} -> binary_to_list(V);
-        false  -> ""
+        {_, V} when is_binary(V) -> V;
+        _                        -> <<>>
     end,
     handle_result(clipboard_server:search_history(Pattern), Req);
 
@@ -73,7 +74,8 @@ route(clipboard, <<"GET">>, Req) ->
 route(clipboard, <<"POST">>, Req0) ->
     case read_json_body(Req0) of
         {ok, #{<<"text">> := Text}, Req1} when is_binary(Text) ->
-            case clipboard_server:set_text(binary_to_list(Text)) of
+            %% 直接传二进制，不要 binary_to_list
+            case clipboard_server:set_text(Text) of
                 ok ->
                     json(200, #{ok => true}, Req1);
                 {error, Reason} ->

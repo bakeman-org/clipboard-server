@@ -1,13 +1,10 @@
 %%%-------------------------------------------------------------------
 %% @doc 剪贴板历史存储 —— 基于自研 SQLite NIF 的持久化层。
 %%
-%% 表结构：
-%%   clipboard_history(id INTEGER PRIMARY KEY AUTOINCREMENT,
-%%                     content TEXT NOT NULL,
-%%                     created_at INTEGER NOT NULL)
-%%
-%% 数据库文件默认位于 $XDG_DATA_HOME/clipboard_server/clipboard.db，
-%% 可用环境变量 CLIPBOARD_DATA_DIR 覆盖。
+%% 关键点：
+%%   - 全程使用二进制，不做 list <-> binary 转换。
+%%   - 插入前对最后一条做"归一化比较"去重。
+%%   - search 同时支持 list / binary 输入，最终转成二进制传入 NIF。
 %% @end
 %%%-------------------------------------------------------------------
 -module(clipboard_store).
@@ -31,26 +28,24 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
-%% @doc 同步插入一条记录。
--spec insert(string()) -> ok | {error, term()}.
-insert(Text) when is_list(Text) ->
+-spec insert(binary() | string()) -> ok | {error, term()}.
+insert(Text) ->
     gen_server:call(?MODULE, {insert, Text}, ?CALL_TIMEOUT).
 
-%% @doc 列出全部历史（最新在前）。
 -spec list_all() -> {ok, [map()]} | {error, term()}.
 list_all() -> list_all(0).
 
-%% @doc 列出最近 Limit 条历史，Limit = 0 表示全部。
 -spec list_all(non_neg_integer()) -> {ok, [map()]} | {error, term()}.
 list_all(Limit) when is_integer(Limit), Limit >= 0 ->
     gen_server:call(?MODULE, {list_all, Limit}, ?CALL_TIMEOUT).
 
-%% @doc 模糊搜索历史，等价于 SQL LIKE '%Pattern%'。
--spec search(string()) -> {ok, [map()]} | {error, term()}.
+%% @doc 模糊搜索。参数可为二进制或字符串。
+-spec search(binary() | string()) -> {ok, [map()]} | {error, term()}.
+search(Pattern) when is_binary(Pattern) ->
+    gen_server:call(?MODULE, {search, Pattern}, ?CALL_TIMEOUT);
 search(Pattern) when is_list(Pattern) ->
-    gen_server:call(?MODULE, {search, Pattern}, ?CALL_TIMEOUT).
+    search(unicode:characters_to_binary(Pattern)).
 
-%% @doc 清空全部历史。
 -spec clear() -> ok | {error, term()}.
 clear() ->
     gen_server:call(?MODULE, clear, ?CALL_TIMEOUT).
@@ -71,10 +66,10 @@ init([]) ->
     end.
 
 handle_call({insert, Text}, _From, #{db := Db} = State) ->
-    Now = erlang:system_time(millisecond),
-    Result = clipboard_sqlite_nif:insert(
-        Db, unicode:characters_to_binary(Text), Now),
-    {reply, Result, State};
+    case to_binary(Text) of
+        {ok, Bin} -> {reply, insert_if_new(Db, Bin), State};
+        error     -> {reply, {error, bad_content}, State}
+    end;
 
 handle_call({list_all, 0}, _From, #{db := Db} = State) ->
     {reply, wrap(clipboard_sqlite_nif:list_all(Db)), State};
@@ -82,8 +77,7 @@ handle_call({list_all, 0}, _From, #{db := Db} = State) ->
 handle_call({list_all, Limit}, _From, #{db := Db} = State) ->
     {reply, wrap(clipboard_sqlite_nif:list_limit(Db, Limit)), State};
 
-handle_call({search, Pattern}, _From, #{db := Db} = State) ->
-    Bin = unicode:characters_to_binary(Pattern),
+handle_call({search, Bin}, _From, #{db := Db} = State) when is_binary(Bin) ->
     {reply, wrap(clipboard_sqlite_nif:search(Db, Bin)), State};
 
 handle_call(clear, _From, #{db := Db} = State) ->
@@ -92,11 +86,16 @@ handle_call(clear, _From, #{db := Db} = State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
-%% 异步落库接口（供 clipboard_server 使用）
+%% 异步落库：watcher 传二进制
+handle_cast({insert_bin, Bin}, #{db := Db} = State) when is_binary(Bin) ->
+    _ = insert_if_new(Db, Bin),
+    {noreply, State};
+
 handle_cast({insert, Text}, #{db := Db} = State) ->
-    Now = erlang:system_time(millisecond),
-    _ = clipboard_sqlite_nif:insert(
-        Db, unicode:characters_to_binary(Text), Now),
+    case to_binary(Text) of
+        {ok, Bin} -> _ = insert_if_new(Db, Bin);
+        error     -> ok
+    end,
     {noreply, State};
 
 handle_cast(_Msg, State) ->
@@ -117,6 +116,55 @@ code_change(_OldVsn, State, _Extra) ->
 %% ===================================================================
 %% 内部函数
 %% ===================================================================
+
+%% 统一把输入转成二进制；非法输入返回 error
+to_binary(B) when is_binary(B) -> {ok, B};
+to_binary(L) when is_list(L) ->
+    case unicode:characters_to_binary(L) of
+        B when is_binary(B) -> {ok, B};
+        _                   -> error
+    end;
+to_binary(_) -> error.
+
+insert_if_new(_, <<>>) ->
+    %% 空内容不入库
+    ok;
+insert_if_new(Db, Bin) ->
+    case is_duplicate(Db, Bin) of
+        true ->
+            logger:debug("clipboard_store: skip duplicate (~p bytes)",
+                         [byte_size(Bin)]),
+            ok;
+        false ->
+            Now = erlang:system_time(millisecond),
+            case clipboard_sqlite_nif:insert(Db, Bin, Now) of
+                ok ->
+                    logger:debug("clipboard_store: inserted ~p bytes",
+                                 [byte_size(Bin)]),
+                    ok;
+                {error, Reason} = Err ->
+                    logger:error("clipboard_store: insert failed: ~p",
+                                 [Reason]),
+                    Err
+            end
+    end.
+
+is_duplicate(Db, Bin) ->
+    Normalized = normalize(Bin),
+    case clipboard_sqlite_nif:list_limit(Db, 1) of
+        [{_, LastBin, _}] ->
+            normalize(LastBin) =:= Normalized;
+        _ ->
+            false
+    end.
+
+normalize(Bin) when is_binary(Bin) ->
+    Trimmed = string:trim(Bin),
+    re:replace(
+        Trimmed,
+        <<"[\x{200B}\x{200C}\x{200D}\x{FEFF}]"/utf8>>,
+        <<>>,
+        [global, {return, binary}]).
 
 db_path() ->
     Dir = case os:getenv("CLIPBOARD_DATA_DIR") of
@@ -145,14 +193,13 @@ ensure_schema(Db) ->
         {error, Reason} -> error({schema_error, Reason})
     end.
 
-%% 把 NIF 返回的 [{Id, ContentBin, Ts}] 转成 [{Id, ContentString, Ts}]
-%% 的 map 列表。若 NIF 已返回 {error, _}，原样返回。
 wrap(Rows) when is_list(Rows) ->
     {ok, [row_to_map(R) || R <- Rows]};
 wrap(Other) ->
     Other.
 
 row_to_map({Id, ContentBin, CreatedAt}) ->
+    %% 已经确定是合法 UTF-8（NIF 存的就是原始文本）
     #{id         => Id,
       content    => unicode:characters_to_list(ContentBin),
       created_at => CreatedAt}.

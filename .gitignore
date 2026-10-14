@@ -21,3 +21,4 @@ rebar3.crashdump
 compile_commands.json
 .cache/
 priv/*.so
+testdata.txt

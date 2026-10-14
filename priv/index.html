@@ -13,6 +13,7 @@
     --muted: #6a737d;
     --accent: #2f81f7;
     --danger: #d1242f;
+    --pill-bg: #eef1f5;
   }
   * { box-sizing: border-box; }
   body {
@@ -21,10 +22,11 @@
                  "Microsoft YaHei", sans-serif;
     background: var(--bg);
     color: var(--text);
-    line-height: 1.5;
+    line-height: 1.65;
+    font-size: 17px;
   }
   header {
-    padding: 20px 24px;
+    padding: 24px 32px;
     background: var(--card);
     border-bottom: 1px solid var(--border);
     position: sticky;
@@ -32,37 +34,41 @@
     z-index: 10;
   }
   h1 {
-    margin: 0 0 12px;
-    font-size: 20px;
+    margin: 0 0 16px;
+    font-size: 26px;
     font-weight: 600;
+    letter-spacing: .3px;
   }
   .toolbar {
     display: flex;
-    gap: 8px;
+    gap: 10px;
     align-items: center;
     flex-wrap: wrap;
   }
   input[type=text] {
-    flex: 1 1 240px;
-    min-width: 180px;
-    padding: 8px 12px;
+    flex: 1 1 300px;
+    min-width: 220px;
+    padding: 12px 16px;
     border: 1px solid var(--border);
-    border-radius: 6px;
-    font-size: 14px;
+    border-radius: 8px;
+    font-size: 17px;
     outline: none;
+    background: #fff;
+    transition: border-color .15s, box-shadow .15s;
   }
   input[type=text]:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(47,129,247,.15);
+    box-shadow: 0 0 0 4px rgba(47,129,247,.15);
   }
   button {
-    padding: 8px 14px;
+    padding: 10px 18px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 8px;
     background: var(--card);
     color: var(--text);
-    font-size: 14px;
+    font-size: 16px;
     cursor: pointer;
+    transition: background .15s, border-color .15s;
   }
   button:hover { background: #f0f2f5; }
   button.primary {
@@ -77,79 +83,138 @@
   }
   button.danger:hover { background: #ffeef0; }
 
-  main { padding: 16px 24px; max-width: 960px; margin: 0 auto; }
+  /* ---------- 示例 pill 区 ---------- */
+  .examples {
+    margin-top: 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    font-size: 14px;
+    color: var(--muted);
+  }
+  .examples-label {
+    font-size: 14px;
+    color: var(--muted);
+    margin-right: 4px;
+  }
+  .pill {
+    padding: 5px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--pill-bg);
+    color: var(--text);
+    font-size: 14px;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    cursor: pointer;
+    transition: all .15s;
+    line-height: 1.2;
+  }
+  .pill:hover {
+    background: #fff;
+    border-color: var(--accent);
+    color: var(--accent);
+    transform: translateY(-1px);
+  }
+  .pill.pill-reset {
+    background: #fff;
+    color: var(--muted);
+  }
+  .pill.pill-reset:hover {
+    color: var(--danger);
+    border-color: #f5c2c7;
+  }
+
+  main { padding: 24px 32px 64px; max-width: 1100px; margin: 0 auto; }
 
   .meta {
     color: var(--muted);
-    font-size: 13px;
-    margin-bottom: 12px;
+    font-size: 15px;
+    margin-bottom: 16px;
   }
 
   .empty {
     text-align: center;
     color: var(--muted);
-    padding: 48px 16px;
+    padding: 64px 24px;
     background: var(--card);
     border: 1px dashed var(--border);
-    border-radius: 8px;
+    border-radius: 10px;
+    font-size: 17px;
   }
 
   .item {
     background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 12px 14px;
-    margin-bottom: 10px;
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 14px;
     display: flex;
-    gap: 12px;
+    gap: 16px;
     align-items: flex-start;
-    transition: border-color .15s;
+    transition: border-color .15s, box-shadow .15s;
   }
-  .item:hover { border-color: #c8ccd1; }
+  .item:hover {
+    border-color: #c8ccd1;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+  }
   .item .content {
     flex: 1;
     white-space: pre-wrap;
     word-break: break-word;
     font-family: ui-monospace, "SF Mono", Consolas, monospace;
-    font-size: 13px;
+    font-size: 16px;
+    line-height: 1.6;
   }
   .item .side {
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 6px;
+    gap: 10px;
     flex-shrink: 0;
   }
   .item .ts {
     color: var(--muted);
-    font-size: 12px;
+    font-size: 14px;
     white-space: nowrap;
+    font-family: ui-monospace, monospace;
   }
   .item .actions button {
-    padding: 4px 8px;
-    font-size: 12px;
+    padding: 6px 12px;
+    font-size: 14px;
+    border-radius: 6px;
   }
   mark {
     background: #fff5b1;
     color: inherit;
-    padding: 0 1px;
-    border-radius: 2px;
+    padding: 0 2px;
+    border-radius: 3px;
   }
   .toast {
     position: fixed;
-    bottom: 20px;
+    bottom: 24px;
     left: 50%;
     transform: translateX(-50%);
     background: #24292f;
     color: #fff;
-    padding: 8px 16px;
-    border-radius: 6px;
-    font-size: 13px;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 15px;
     opacity: 0;
     transition: opacity .2s;
     pointer-events: none;
+    box-shadow: 0 4px 16px rgba(0,0,0,.15);
   }
-  .toast.show { opacity: 0.92; }
+  .toast.show { opacity: .94; }
+
+  /* 小屏幕微调 */
+  @media (max-width: 640px) {
+    header { padding: 16px 18px; }
+    h1 { font-size: 22px; }
+    main { padding: 16px 18px 48px; }
+    .item { flex-direction: column; }
+    .item .side { align-self: flex-end; }
+  }
 </style>
 </head>
 <body>
@@ -161,6 +226,18 @@
            placeholder="输入关键字过滤（grep 风格，支持 % 和 _ 通配符）">
     <button id="btn-refresh">刷新</button>
     <button id="btn-clear" class="danger">清空</button>
+  </div>
+
+  <div class="examples">
+    <span class="examples-label">示例：</span>
+    <button class="pill" data-q="hello"          title="包含 hello 的记录">hello</button>
+    <button class="pill" data-q="%历史"          title="以“历史”结尾的记录">%历史</button>
+    <button class="pill" data-q="剪%"            title="以“剪”开头的记录">剪%</button>
+    <button class="pill" data-q="剪___"          title="“剪”后跟任意 3 个字符">剪___</button>
+    <button class="pill" data-q="http%com"       title="http 与 com 之间任意内容（例如 URL）">http%com</button>
+    <button class="pill" data-q="error"          title="包含 error 的记录">error</button>
+    <button class="pill" data-q="%"              title="匹配所有非空记录">%</button>
+    <button class="pill pill-reset" data-q=""    title="清空过滤条件，显示全部">清空</button>
   </div>
 </header>
 
@@ -196,7 +273,6 @@
          + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
-  // 简单 HTML 转义
   function esc(s) {
     return String(s)
       .replace(/&/g, "&amp;")
@@ -205,7 +281,7 @@
       .replace(/"/g, "&quot;");
   }
 
-  // 高亮过滤词（默认按子串，忽略 %/_ 通配）
+  // 高亮：去掉 %/_ 通配后按子串高亮
   function highlight(text, q) {
     if (!q) return esc(text);
     const plain = q.replace(/[%_]/g, "");
@@ -260,10 +336,20 @@
     `).join("");
   }
 
-  // 事件绑定
+  // 事件：搜索框输入（防抖 200ms）
   $search.addEventListener("input", () => {
     clearTimeout($search._t);
     $search._t = setTimeout(() => load($search.value.trim()), 200);
+  });
+
+  // 示例 pill 点击 → 填入搜索框并立即过滤
+  document.querySelectorAll(".pill").forEach(p => {
+    p.addEventListener("click", () => {
+      const q = p.getAttribute("data-q") || "";
+      $search.value = q;
+      load(q);
+      $search.focus();
+    });
   });
 
   $refresh.addEventListener("click", () => load($search.value.trim()));
@@ -281,7 +367,7 @@
     }
   });
 
-  // 列表内“复制”按钮 → 写回系统剪贴板
+  // 复制按钮 → 写回系统剪贴板
   $list.addEventListener("click", async e => {
     const btn = e.target.closest("button[data-act=copy]");
     if (!btn) return;
@@ -298,6 +384,13 @@
       toast("写入失败：" + err.message);
     }
   });
+
+  // 自动刷新：每 2 秒拉一次（页面隐藏时暂停）
+  setInterval(() => {
+    if (!document.hidden) {
+      load($search.value.trim());
+    }
+  }, 2000);
 
   // 初次加载
   load("");
