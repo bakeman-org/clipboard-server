@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>剪贴板历史</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --border: #e3e6ea;
+    --text: #24292f;
+    --muted: #6a737d;
+    --accent: #2f81f7;
+    --danger: #d1242f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", "PingFang SC",
+                 "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }
+  header {
+    padding: 20px 24px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  h1 {
+    margin: 0 0 12px;
+    font-size: 20px;
+    font-weight: 600;
+  }
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  input[type=text] {
+    flex: 1 1 240px;
+    min-width: 180px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 14px;
+    outline: none;
+  }
+  input[type=text]:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(47,129,247,.15);
+  }
+  button {
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--card);
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #f0f2f5; }
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  button.primary:hover { background: #1f6feb; }
+  button.danger {
+    color: var(--danger);
+    border-color: #f5c2c7;
+  }
+  button.danger:hover { background: #ffeef0; }
+
+  main { padding: 16px 24px; max-width: 960px; margin: 0 auto; }
+
+  .meta {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 12px;
+  }
+
+  .empty {
+    text-align: center;
+    color: var(--muted);
+    padding: 48px 16px;
+    background: var(--card);
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+  }
+
+  .item {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    transition: border-color .15s;
+  }
+  .item:hover { border-color: #c8ccd1; }
+  .item .content {
+    flex: 1;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 13px;
+  }
+  .item .side {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .item .ts {
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .item .actions button {
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+  mark {
+    background: #fff5b1;
+    color: inherit;
+    padding: 0 1px;
+    border-radius: 2px;
+  }
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #24292f;
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity .2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 0.92; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📋 剪贴板历史</h1>
+  <div class="toolbar">
+    <input id="search" type="text"
+           placeholder="输入关键字过滤（grep 风格，支持 % 和 _ 通配符）">
+    <button id="btn-refresh">刷新</button>
+    <button id="btn-clear" class="danger">清空</button>
+  </div>
+</header>
+
+<main>
+  <div class="meta" id="meta">加载中…</div>
+  <div id="list"></div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  const $search  = document.getElementById("search");
+  const $list    = document.getElementById("list");
+  const $meta    = document.getElementById("meta");
+  const $refresh = document.getElementById("btn-refresh");
+  const $clear   = document.getElementById("btn-clear");
+  const $toast   = document.getElementById("toast");
+
+  let currentQuery = "";
+
+  function toast(msg) {
+    $toast.textContent = msg;
+    $toast.classList.add("show");
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => $toast.classList.remove("show"), 1800);
+  }
+
+  function fmtTime(ms) {
+    const d = new Date(ms);
+    const pad = n => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} `
+         + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // 简单 HTML 转义
+  function esc(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  // 高亮过滤词（默认按子串，忽略 %/_ 通配）
+  function highlight(text, q) {
+    if (!q) return esc(text);
+    const plain = q.replace(/[%_]/g, "");
+    if (!plain) return esc(text);
+    const idx = text.toLowerCase().indexOf(plain.toLowerCase());
+    if (idx < 0) return esc(text);
+    return esc(text.slice(0, idx))
+         + "<mark>" + esc(text.slice(idx, idx + plain.length)) + "</mark>"
+         + esc(text.slice(idx + plain.length));
+  }
+
+  async function fetchJSON(url, opts) {
+    const r = await fetch(url, opts);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  }
+
+  async function load(q) {
+    currentQuery = q || "";
+    $meta.textContent = "加载中…";
+    try {
+      const url = currentQuery
+        ? `/api/history/search?q=${encodeURIComponent(currentQuery)}`
+        : `/api/history`;
+      const res = await fetchJSON(url);
+      if (!res.ok) throw new Error(res.error || "未知错误");
+      render(res.data);
+      $meta.textContent = currentQuery
+        ? `匹配 “${currentQuery}” 的记录：${res.data.length} 条`
+        : `共 ${res.data.length} 条记录`;
+    } catch (e) {
+      $meta.textContent = "加载失败：" + e.message;
+      $list.innerHTML = "";
+    }
+  }
+
+  function render(items) {
+    if (!items.length) {
+      $list.innerHTML = `<div class="empty">暂无记录</div>`;
+      return;
+    }
+    $list.innerHTML = items.map(it => `
+      <div class="item">
+        <div class="content">${highlight(it.content, currentQuery)}</div>
+        <div class="side">
+          <div class="ts">#${it.id} · ${fmtTime(it.created_at)}</div>
+          <div class="actions">
+            <button data-act="copy" data-text="${esc(it.content)}">复制</button>
+          </div>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  // 事件绑定
+  $search.addEventListener("input", () => {
+    clearTimeout($search._t);
+    $search._t = setTimeout(() => load($search.value.trim()), 200);
+  });
+
+  $refresh.addEventListener("click", () => load($search.value.trim()));
+
+  $clear.addEventListener("click", async () => {
+    if (!confirm("确定清空全部剪贴板历史？此操作不可撤销。")) return;
+    try {
+      const res = await fetchJSON("/api/clear", { method: "DELETE" });
+      if (!res.ok) throw new Error(res.error || "未知错误");
+      toast("已清空");
+      load("");
+      $search.value = "";
+    } catch (e) {
+      toast("清空失败：" + e.message);
+    }
+  });
+
+  // 列表内“复制”按钮 → 写回系统剪贴板
+  $list.addEventListener("click", async e => {
+    const btn = e.target.closest("button[data-act=copy]");
+    if (!btn) return;
+    const text = btn.getAttribute("data-text") || "";
+    try {
+      const res = await fetchJSON("/api/clipboard", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text })
+      });
+      if (!res.ok) throw new Error(res.error || "未知错误");
+      toast("已写回剪贴板");
+    } catch (err) {
+      toast("写入失败：" + err.message);
+    }
+  });
+
+  // 初次加载
+  load("");
+})();
+</script>
+</body>
+</html>

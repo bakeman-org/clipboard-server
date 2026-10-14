@@ -1,0 +1,14 @@
+{application, clipboard_server, [
+    {description, "剪贴板服务器：监听系统剪贴板、持久化历史、提供 REST API"},
+    {vsn, "0.1.0"},
+    {registered, [clipboard_server_sup, clipboard_server,
+                  clipboard_store, clipboard_http]},
+    {mod, {clipboard_server_app, []}},
+    {applications, [kernel, stdlib, cowboy, jsx]},
+    {env, [
+        {http_port, 8080}
+    ]},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.
